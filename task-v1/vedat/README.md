@@ -38,6 +38,29 @@ Ana kontrolcüden gelen PWM değerlerini ve görev durumlarını dinleyerek term
 
 ---
 
+## 📂 Proje Dosya Ağacı (Workspace Yapısı)
+
+GitHub reposunda yalnızca kaynak kodlar (`src`) ve test medyaları (`media`) bulunmaktadır. ROS 2 derleme klasörleri (`build`, `install`, `log`) temizlenmiş haldedir.
+
+```text
+center_detector-v3_ws/
+├── media/                     # Test için kullanılan ArUco görüntü ve videoları
+│   ├── foto_01.jpg ...
+│   └── video_01.mp4 ...
+│
+└── src/                       # ROS 2 Kaynak (Source) Klasörü
+    └── aruco_docking/
+        ├── aruco_docking/     # Ana Python modülleri ve Node'lar
+        │   ├── __init__.py
+        │   ├── aruco_detector.py        # Görüntü işleme, PnP ve PID hesaplamaları
+        │   ├── docking_mission_node.py  # Ana görev yöneticisi ve HUD kontrolcüsü
+        │   └── mission_listener_node.py # PWM ve görev durumlarını loglayan node
+        │
+        ├── package.xml        # ROS 2 paket bağımlılıkları (rclpy, cv_bridge vb.)
+        ├── setup.cfg          # Çalıştırılabilir dosya ayarları
+        └── setup.py           # Paket derleme ve entry_point (node) tanımları
+```
+
 ## 🚀 Kurulum ve Çalıştırma
 
 ### Gereksinimler
