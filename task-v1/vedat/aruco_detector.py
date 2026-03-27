@@ -88,13 +88,13 @@ class ArUcoDetector:
         self.pid_surge = PID(kp=80.0,  ki=1.0, kd=15.0, min_val=-300, max_val=300, name="Surge")
         self.pid_sway  = PID(kp=100.0, ki=1.0, kd=20.0, min_val=-300, max_val=300, name="Sway")
         self.pid_heave = PID(kp=120.0, ki=2.0, kd=20.0, min_val=-300, max_val=300, name="Heave")
-        self.pid_yaw   = PID(kp=4.0,   ki=0.0, kd=1.0,  min_val=-200, max_val=200, name="Yaw")
+        self.pid_yaw   = PID(kp=25.0,  ki=0.0, kd=1.0,  min_val=-200, max_val=200, name="Yaw")
 
         # Low Pass Filters for Pose Smoothing
         self.lpf_x = LowPassFilter(0.7)
         self.lpf_y = LowPassFilter(0.7)
         self.lpf_z = LowPassFilter(0.8)
-        self.lpf_yaw = LowPassFilter(0.6)
+        self.lpf_yaw = LowPassFilter(0.85)
 
         self.target_stop_distance = 0.45
 

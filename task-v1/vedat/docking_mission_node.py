@@ -17,7 +17,7 @@ class DockingMissionNode(Node):
         super().__init__('docking_mission_node')
         
         # Parameters
-        self.declare_parameter('video_source', '/home/vedat/center_detector-v2_ws/media/video_05.mp4')
+        self.declare_parameter('video_source', '/dev/video0')
         self.declare_parameter('target_mode', 'GUIDED')
         self.declare_parameter('use_camera_topic', False) 
         
@@ -123,6 +123,7 @@ class DockingMissionNode(Node):
         ret, frame = self.cap.read()
         if not ret:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            cv2.destroyAllWindows()
             return
             
         self.process_frame(frame)
@@ -191,7 +192,10 @@ class DockingMissionNode(Node):
                 cx, cy = self.hud_centroid
                 sway = int(((cx - 960) / 960.0) * 400)
                 heave_offset = int(((cy - 540) / 540.0) * 250)
-                self.command_rov(surge=150, sway=sway, heave=-heave_offset)
+                
+                # Yaklaşma modunda da YAW kontrolü ekleyerek hedefe yönelmeyi sağlıyoruz
+                approaching_yaw = int(((cx - 960) / 960.0) * 300)
+                self.command_rov(surge=150, sway=sway, heave=-heave_offset, yaw=-approaching_yaw)
 
         # 3. HUD Çizimini Çağır
         self.draw_hud(frame)
@@ -233,6 +237,7 @@ class DockingMissionNode(Node):
         
         cv2.imshow("TAC 2026 - RAMI ROV", small_frame)
         cv2.waitKey(1)
+        
 
     def handle_docked_state(self):
         self.command_rov(surge=0, sway=0, heave=0, yaw=0)
