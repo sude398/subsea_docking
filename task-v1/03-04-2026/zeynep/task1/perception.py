@@ -7,7 +7,7 @@ from . import config
 class MarkerDetector:
     def __init__(self):
         self.detector = aruco.ArucoDetector(
-            aruco.getPredefinedDictionary(aruco.DICT_4X4_50),
+            aruco.getPredefinedDictionary(aruco.DICT_ARUCO_ORIGINAL),
             aruco.DetectorParameters()
         )
         # solvePnP için 3D nesne noktaları (marker düzlemde, z=0)
