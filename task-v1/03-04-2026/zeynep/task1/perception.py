@@ -45,78 +45,77 @@ class MarkerCluster:
         self.alpha_yaw  = 0.5
 
     def compute(self, corners_raw, ids_raw):
-        
         if ids_raw is None or len(ids_raw) == 0:
+            # Marker yoksa son bilinen filtreli değerleri koru, kilit yok
             return False, 0, 0, self.filtered_dist_h, self.filtered_dist_v, self.filtered_yaw, 0
 
-        centers   = [np.mean(c[0], axis=0) for c in corners_raw]
-        dists_h   = []
-        dists_v   = []
-        sin_yaws  = []
-        cos_yaws  = []
+        n = len(ids_raw)
+        indices_to_use = list(range(n))
+        is_locked = False
+        all_centers = [np.mean(c[0], axis=0) for c in corners_raw]
 
-        for i, mid in enumerate(ids_raw.flatten()):
-            ok, rvec, tvec = cv2.solvePnP(
-                self.helper.obj_pts,
-                corners_raw[i][0].astype(np.float32),
-                config.CAMERA_MATRIX,
-                config.DIST_COEFFS
-            )
+        # --- 1. Aşama: Kilit Mantığı ---
+        if n == 1:
+            is_locked = False 
+        elif n == 2:
+            p1, p2 = all_centers[0], all_centers[1]
+            pixel_dist = np.linalg.norm(p1 - p2)
+            ok, _, tvec = cv2.solvePnP(self.helper.obj_pts, corners_raw[0][0].astype(np.float32), 
+                                     config.CAMERA_MATRIX, config.DIST_COEFFS)
+            if ok:
+                dist_m = np.linalg.norm(tvec)
+                # config.FOCAL_LENGTH_PX ve 1.138 (diagonal m) kullanımı
+                expected_diag_px = (1.138 * config.FOCAL_LENGTH_PX) / max(dist_m, 0.1)
+                is_locked = pixel_dist > (expected_diag_px * 0.85)
+        elif n == 3:
+            max_d = 0
+            diag_pair = (0, 1)
+            for i, j in [(0, 1), (0, 2), (1, 2)]:
+                d = np.linalg.norm(all_centers[i] - all_centers[j])
+                if d > max_d:
+                    max_d = d
+                    diag_pair = (i, j)
+            indices_to_use = list(diag_pair)
+            is_locked = True
+        elif n >= 4:
+            is_locked = True
 
-            if not ok:
-                continue
+        # --- 2. Aşama: Hesaplamalar ---
+        centers_to_avg, dists_h, dists_v, sin_yaws, cos_yaws = [], [], [], [], []
 
-            t = tvec.flatten()
+        for idx in indices_to_use:
+            ok, rvec, tvec = cv2.solvePnP(self.helper.obj_pts, corners_raw[idx][0].astype(np.float32),
+                                        config.CAMERA_MATRIX, config.DIST_COEFFS)
+            if ok:
+                centers_to_avg.append(all_centers[idx])
+                t = tvec.flatten()
+                dists_h.append(np.sqrt(t[0]**2 + t[2]**2) / config.UNDERWATER_REFRACTION)
+                dists_v.append(abs(t[1]) / config.UNDERWATER_REFRACTION)
+                R, _ = cv2.Rodrigues(rvec)
+                yaw = np.arctan2(R[1, 0], R[0, 0])
+                sin_yaws.append(np.sin(yaw))
+                cos_yaws.append(np.cos(yaw))
 
-            # Kamera koordinat sistemi: X sağ, Y aşağı, Z ileri
-            # Yatay mesafe: XZ düzleminde (derinlik + sağ-sol)
-            # Dikey mesafe: Y ekseni (kameradan marker'a yukarı/aşağı fark)
-            raw_dist_h = np.sqrt(t[0]**2 + t[2]**2) / config.UNDERWATER_REFRACTION
-            raw_dist_v = abs(t[1])                   / config.UNDERWATER_REFRACTION
-
-            dists_h.append(raw_dist_h)
-            dists_v.append(raw_dist_v)
-
-            # Yaw: marker'ın Z ekseni etrafındaki dönüşü
-            R, _ = cv2.Rodrigues(rvec)
-            yaw  = np.arctan2(R[1, 0], R[0, 0])
-            sin_yaws.append(np.sin(yaw))
-            cos_yaws.append(np.cos(yaw))
-
-        # ── DIST EMA FİLTRESİ ──────────────────────────────────────────
+        # --- 3. Aşama: Filtreleme ---
         if dists_h:
-            self.filtered_dist_h = (
-                self.alpha_dist * np.mean(dists_h) +
-                (1 - self.alpha_dist) * self.filtered_dist_h
-            )
-            self.filtered_dist_v = (
-                self.alpha_dist * np.mean(dists_v) +
-                (1 - self.alpha_dist) * self.filtered_dist_v
-            )
-
-        # ── YAW CIRCULAR EMA FİLTRESİ ──────────────────────────────────
-        # Düz ortalama yerine circular average kullan:
-        # 350° ve 10°'nin ortalaması 180° değil, 0° olmalı.
+            self.filtered_dist_h = self.alpha_dist * np.mean(dists_h) + (1 - self.alpha_dist) * self.filtered_dist_h
+            self.filtered_dist_v = self.alpha_dist * np.mean(dists_v) + (1 - self.alpha_dist) * self.filtered_dist_v
+        
         if sin_yaws:
             raw_yaw = np.arctan2(np.mean(sin_yaws), np.mean(cos_yaws))
-            dyaw = np.arctan2(
-                np.sin(raw_yaw - self.filtered_yaw),
-                np.cos(raw_yaw - self.filtered_yaw)
-            )
+            dyaw = np.arctan2(np.sin(raw_yaw - self.filtered_yaw), np.cos(raw_yaw - self.filtered_yaw))
             self.filtered_yaw += self.alpha_yaw * dyaw
 
-        # ── PLATFORM MERKEZİ (piksel) ───────────────────────────────────
-        cx = int(np.mean([p[0] for p in centers]))
-        cy = int(np.mean([p[1] for p in centers]))
-
-        # ── LOCK KRİTERİ ───────────────────────────────────────────────
-        # Uzakta 2+ marker şart (güvenilir pose).
-        # Yakında (blind zone) 1 marker yeterli — kamera açısından dolayı
-        # bazı marker'lar frame dışına çıkar.
-        n = len(ids_raw)
-        if self.filtered_dist_h > config.DIST_BLIND_ZONE:
-            is_locked = n >= 2
+        # Merkez hesabı
+        if centers_to_avg:
+            cx = int(np.mean([p[0] for p in centers_to_avg]))
+            cy = int(np.mean([p[1] for p in centers_to_avg]))
         else:
-            is_locked = n >= 1
+            # PnP başarısızsa ekranın ortasını vererek sapıtmasını önle (veya son cx,cy tutulabilir)
+            cx, cy = config.IMAGE_WIDTH // 2, config.IMAGE_HEIGHT // 2
+
+        # Blind Zone Koruma: n=1 olsa bile eğer çok yakındaysak kilidi zorla aç
+        if self.filtered_dist_h < config.DIST_BLIND_ZONE and n >= 1:
+            is_locked = True
 
         return is_locked, cx, cy, self.filtered_dist_h, self.filtered_dist_v, self.filtered_yaw, n
