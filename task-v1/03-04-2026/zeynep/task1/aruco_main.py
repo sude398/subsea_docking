@@ -3,11 +3,10 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Float32MultiArray
 from cv_bridge import CvBridge
 
 import cv2
-import cv2.aruco as aruco
 import numpy as np
 
 from . import config
@@ -18,12 +17,12 @@ from .rov_control import PID, SmartSearch, RovInterface
 # ─────────────────────────────────────────────
 # FSM STATES
 # ─────────────────────────────────────────────
-STATE_SEARCHING   = "SEARCHING" # no markers are seen
-STATE_ALIGNING    = "ALIGNING" # at least one marker is seen, but not aligned
-STATE_APPROACHING = "APPROACHING" # aligned but not close enough
-STATE_DESCENDING  = "DESCENDING" # close enough to descend, but not docked yet
-STATE_DOCKED      = "DOCKED" # docked (distance < 0.2m)
-STATE_FAILSAFE    = "FAILSAFE" # lost target for more than 3 seconds
+STATE_SEARCHING   = "SEARCHING"    # marker görünmüyor
+STATE_ALIGNING    = "ALIGNING"     # marker görünüyor, yaw hizalanıyor
+STATE_APPROACHING = "APPROACHING"  # yaw hizalandı, yatay yaklaşma
+STATE_DESCENDING  = "DESCENDING"   # platform altında, dikey iniş
+STATE_DOCKED      = "DOCKED"       # kenetlendi
+STATE_FAILSAFE    = "FAILSAFE"     # 5 sn+ hedef kaybı
 
 
 class DockingNode(Node):
@@ -33,106 +32,114 @@ class DockingNode(Node):
 
         self.bridge = CvBridge()
 
-        # ── Vision ─────────────────────────────
+        # ── Algılama ───────────────────────────
         self.detector = MarkerDetector()
         self.cluster  = MarkerCluster()
 
-        # ── ROV ────────────────────────────────
-        self.rov = RovInterface()
+        self.rov    = RovInterface()
         self.search = SmartSearch()
 
-        # ── PID controllers ────────────────────
-        # araç çok yavaş yaklaşıyorsa p yi arttır
-        # araç sürekli sallanıyorsa d yi arttır
-        # araç hedefte duruyor ama 5-10cm sapma varsa i yi arttır
+        # ── PID Kontrolcüler ───────────────────
+        # pid_x  → ileri/geri hareketi kontrol eder (ey hatası)
+        # pid_y  → sağ/sol hareketi kontrol eder   (ex hatası)
+        # pid_yaw → yaw dönüşünü kontrol eder
         
+        #   Araç yavaş yaklaşıyorsa kp artır.
+        #   Araç sallanıyorsa kd artır veya rate_limit düşür.
+        #   Sabit küçük sapma varsa ki artır.
         self.pid_x   = PID(0.8, 0.05, 0.20, limit=config.MAX_LATERAL, rate_limit=0.04)
         self.pid_y   = PID(0.8, 0.05, 0.20, limit=config.MAX_LATERAL, rate_limit=0.04)
-        self.pid_yaw = PID(0.6, 0.02, 0.15, limit=config.MAX_YAW, rate_limit=0.03)
+        self.pid_yaw = PID(0.6, 0.02, 0.15, limit=config.MAX_YAW,     rate_limit=0.03)
 
-        # ── State ──────────────────────────────
-        self.state = STATE_SEARCHING
-        self.frame = None
-
-        self.current_dist = 5.0
+        # ── State Değişkenleri ─────────────────
+        self.state       = STATE_SEARCHING
+        self.frame       = None
         self.last_seen_t = time.time()
         self.lock_streak = 0
 
-        # ── ROS ────────────────────────────────
+        # Son bilinen değerler — blind zone'da kullanılır
+        self.last_cx   = config.IMAGE_WIDTH  // 2
+        self.last_cy   = config.IMAGE_HEIGHT // 2
+        self.last_dist_h = 3.0
+        self.last_dist_v = 1.0
+        self.last_yaw    = 0.0
+
+        # ── ROS Publisher / Subscriber ─────────
         self.create_subscription(Image, '/camera/image_raw', self._on_image, 10)
 
-        self.pub_img   = self.create_publisher(Image, '/rov/image_processed', 10)
-        self.pub_state = self.create_publisher(String, '/rov/state', 10)
-        self.pub_dist  = self.create_publisher(Float32, '/rov/distance', 10)
+        self.pub_img   = self.create_publisher(Image,          '/rov/image_processed', 10)
+        self.pub_state = self.create_publisher(String,         '/rov/state',           10)
+        self.pub_dist  = self.create_publisher(Float32,        '/rov/distance',        10)
+        # Gönderilen hız komutlarını izlemek için
+        self.pub_cmd   = self.create_publisher(Float32MultiArray, '/rov/cmd_vel_debug', 10)
 
-        self.create_timer(0.033, self.loop) # kod saniyede 30 kez çalışır
+        # 30 Hz döngü
+        self.create_timer(0.033, self.loop) #kod saniyede 30 kez çalışıyor
 
-        self.get_logger().info("Docking Node READY")
+        self.get_logger().info("Docking Node HAZIR")
 
+    # ─────────────────────────────────────────
     # IMAGE CALLBACK
+    # ─────────────────────────────────────────
     def _on_image(self, msg):
         self.frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
 
-    # MAIN LOOP
+    # ─────────────────────────────────────────
+    # ANA DÖNGÜ
+    # ─────────────────────────────────────────
     def loop(self):
-
         if self.frame is None:
             return
 
-        frame_raw = cv2.rotate(self.frame.copy(), cv2.ROTATE_180)
+        # Kamera ters bağlı → 180° döndür
+        frame = cv2.rotate(self.frame.copy(), cv2.ROTATE_180)
 
-        # ── IPM ─────────────────────────────
-        ipm_view = cv2.warpPerspective(
-            frame_raw,
-            config.IPM_MATRIX,
-            (config.IMAGE_WIDTH, config.IMAGE_HEIGHT),
-        )
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.detector.detect(gray)
 
-        # ── Detection ───────────────────────
-        gray_ipm = cv2.cvtColor(ipm_view, cv2.COLOR_BGR2GRAY)
-        gray_raw = cv2.cvtColor(frame_raw, cv2.COLOR_BGR2GRAY)
+        is_lock, cx, cy, dist_h, dist_v, yaw, mcnt = self.cluster.compute(corners, ids)
 
-        corners_ipm, ids_ipm, _ = self.detector.detect(gray_ipm)
-        corners_raw, ids_raw, _ = self.detector.detect(gray_raw)
+        # Geçerli tespitlerde son bilinen değerleri güncelle
+        if is_lock:
+            self.last_cx     = cx
+            self.last_cy     = cy
+            self.last_dist_h = dist_h
+            self.last_dist_v = dist_v
+            self.last_yaw    = yaw
 
-        # ── Cluster ──────────────────────────
-        is_lock, cx, cy, dist, yaw, mcnt = self.cluster.compute(
-            corners_ipm, ids_ipm, corners_raw, self.current_dist
-        )
-
-        self.current_dist = dist
-
-        # ── Lock tracking ───────────────────
-        if ids_ipm is not None and len(ids_ipm) > 0:
+        # ── Kilit Takibi ────────────────────────
+        if ids is not None and len(ids) > 0:
             self.lock_streak += 1
-            self.last_seen_t = time.time()
+            self.last_seen_t  = time.time()
         else:
-            self.lock_streak = 0
+            self.lock_streak  = 0
 
+        # Geçici titreme / tek frame kaybını filtrele
         confirmed_lock = self.lock_streak >= 2
-        lost_time = time.time() - self.last_seen_t
+        lost_time      = time.time() - self.last_seen_t
 
-        # ── FSM ─────────────────────────────
-        self._fsm(confirmed_lock, dist, lost_time)
+        # ── FSM ─────────────────────────────────
+        self._fsm(confirmed_lock, dist_h, dist_v, lost_time)
 
-        # ── CONTROL ─────────────────────────
-        self._control(confirmed_lock, cx, cy, dist, yaw)
+        # ── Kontrol ─────────────────────────────
+        self._control(confirmed_lock, cx, cy, dist_h, dist_v, yaw)
 
-        # ── HUD ─────────────────────────────
-        self._hud(ipm_view, cx, cy, dist, yaw)
+        # ── HUD ─────────────────────────────────
+        self._hud(frame, cx, cy, dist_h, dist_v, yaw, mcnt)
 
-        self.pub_img.publish(self.bridge.cv2_to_imgmsg(ipm_view, 'bgr8'))
-
+        # ── Yayın ───────────────────────────────
+        self.pub_img.publish(self.bridge.cv2_to_imgmsg(frame, 'bgr8'))
         self.pub_state.publish(String(data=self.state))
-        self.pub_dist.publish(Float32(data=float(dist)))
+        self.pub_dist.publish(Float32(data=float(dist_h)))
 
-
+    # ─────────────────────────────────────────
     # FINITE STATE MACHINE
-    def _fsm(self, lock, dist, lost):
-
+    # ─────────────────────────────────────────
+    def _fsm(self, lock, dist_h, dist_v, lost):
         prev = self.state
 
-        if lost > config.FAILSAFE_LOST:
+        # ── Failsafe: uzun süre hedef yok ──────
+        if lost > config.FAILSAFE_LOST and self.state != STATE_DOCKED:
             self.state = STATE_FAILSAFE
 
         elif self.state == STATE_FAILSAFE:
@@ -140,130 +147,172 @@ class DockingNode(Node):
                 self.state = STATE_ALIGNING
                 self.search.reset()
 
+        # ── Arama ───────────────────────────────
         elif self.state == STATE_SEARCHING:
             if lock:
                 self.state = STATE_ALIGNING
                 self.search.reset()
 
+        # ── Yaw Hizalama ────────────────────────
         elif self.state == STATE_ALIGNING:
             if not lock:
                 self.state = STATE_SEARCHING
-            elif dist < config.DIST_ALIGN:
+            elif dist_h < config.DIST_ALIGN:
                 self.state = STATE_APPROACHING
 
+        # ── Yatay Yaklaşma ──────────────────────
         elif self.state == STATE_APPROACHING:
             if not lock:
                 self.state = STATE_SEARCHING
-            elif dist < config.DIST_DESCENDING:
+            elif dist_h < config.DIST_DESCENDING:
                 self.state = STATE_DESCENDING
 
+        # ── Dikey İniş ──────────────────────────
         elif self.state == STATE_DESCENDING:
-            if not lock:
-                self.state = STATE_SEARCHING
-            elif dist < config.DIST_DOCKED:
+            if dist_v < config.DIST_DOCKED:
+                # Kenetlendi
                 self.state = STATE_DOCKED
                 self.rov.stop()
-                self.get_logger().info("DOCKED")
+                self.get_logger().info("✓ DOCKED — kenetleme tamamlandı")
+
+            elif not lock and dist_h > config.DIST_BLIND_ZONE:
+                # Uzaktayken lock kaybı → gerçekten kayboldu
+                self.state = STATE_SEARCHING
+
+            # dist_h <= DIST_BLIND_ZONE ve lock yok → kamera platformu göremez,
+            # son bilinen hatayla devam et (aşağıda _control bunu işler)
 
         if prev != self.state:
-            self.get_logger().info(f"{prev} → {self.state}")
+            self.get_logger().info(f"FSM: {prev} → {self.state}")
 
-    # ─────────────────────────────
-    # CONTROL
-    # ─────────────────────────────
-    def _control(self, lock, cx, cy, dist, yaw):
+    # ─────────────────────────────────────────
+    # KONTROL
+    # ─────────────────────────────────────────
+    def _control(self, lock, cx, cy, dist_h, dist_v, yaw):
 
         if self.state == STATE_DOCKED:
             return
 
+        # ── Arama / Failsafe ────────────────────
         if self.state in [STATE_SEARCHING, STATE_FAILSAFE]:
             vz, vyaw = self.search.get_velocity()
-            self.rov.send_velocity(0, 0, vz, vyaw)
+            self._send(0.0, 0.0, vz, vyaw)
             return
 
-        if not lock:
+        if not lock and self.state != STATE_DESCENDING:
             self.rov.stop()
             return
 
-        half_w = config.IMAGE_WIDTH / 2
-        half_h = config.IMAGE_HEIGHT / 2
+        # ── Piksel Hata Hesabı ──────────────────
+        half_w = config.IMAGE_WIDTH  / 2.0
+        half_h = config.IMAGE_HEIGHT / 2.0
+        fx     = config.FOCAL_LENGTH_PX
 
-        # aracın istasyonu kameraya göre değil gövdesine göre ortalamasını sağlar
-        CAMERA_OFFSET = 0.50 # Kameranın merkeze olan gerçek mesafesini (m) güncelle
-        fx = config.FOCAL_LENGTH_PX
-
-        offset_px = (fx * CAMERA_OFFSET) / max(dist, 0.3)
+        # Kamera 50cm önde olduğu için, araç merkezi platforma hizalandığında
+        # marker görüntüde merkezin ÜSTÜNDE görünmeli (kamera ileriye bakıyor).
+        # Bu nedenle target_y = half_h - offset_px (işaret eksi).
+        
+        #   Kamera ileriye (ve 30° aşağı) bakıyor.
+        #   Aracın merkezi kameradan 50cm arkada.
+        #   Bu 50cm'yi görüntüde doğru yere yansıtmak için:
+        #   offset_px = fx * CAMERA_FORWARD_OFFSET / dist_h
+        #
+        # Yakınlaştıkça offset artar (açı büyür) — bu doğru davranış.
+        offset_px = fx * config.CAMERA_FORWARD_OFFSET_M / max(dist_h, 0.3)
 
         target_x = half_w
-        target_y = half_h + offset_px
+        target_y = half_h - offset_px   # ← EKSİ: marker görüntünün üst yarısında hedefleniyor
 
+        # Normalize hata [-1, +1]
         ex = (cx - target_x) / half_w
         ey = (cy - target_y) / half_h
 
+        # Deadzone — küçük sapmaları sıfırla, titreme önle
         if abs(cx - target_x) < config.DEADZONE_PX:
-            ex = 0
+            ex = 0.0
         if abs(cy - target_y) < config.DEADZONE_PX:
-            ey = 0
+            ey = 0.0
 
-        # ── ALIGN ─────────────────────────
+        # Blind zone'da lock yoksa son bilinen hatayı kullan
+        if not lock:
+            last_ex = (self.last_cx - target_x) / half_w
+            last_ey = (self.last_cy - target_y) / half_h
+            ex, ey  = last_ex, last_ey
+            yaw     = self.last_yaw
+
+        # ── ALIGNING: sadece yaw düzelt ─────────
         if self.state == STATE_ALIGNING:
             vyaw = self.pid_yaw.update(-yaw)
-            self.rov.send_velocity(0, 0, 0, vyaw)
+            self._send(0.0, 0.0, 0.0, vyaw)
 
-        # ── APPROACH ──────────────────────
+        # ── APPROACHING: yatay yaklaş ───────────
         elif self.state == STATE_APPROACHING:
-            vx = self.pid_y.update(ey)
-            vy = self.pid_x.update(ex)
+            vx   = self.pid_x.update(ey)    # ey → ileri/geri
+            vy   = self.pid_y.update(ex)    # ex → sağ/sol
             vyaw = self.pid_yaw.update(-yaw)
+            self._send(vx, vy, 0.0, vyaw)
 
-            self.rov.send_velocity(vx, vy, 0, vyaw)
-
-        # ── DESCEND ───────────────────────
+        # ── DESCENDING: aşağı in ────────────────
         elif self.state == STATE_DESCENDING:
-            vx = self.pid_y.update(ey)
-            vy = self.pid_x.update(ex)
-            vyaw = self.pid_yaw.update(-yaw) # İniş anında burnu sabit tut
+            vx   = self.pid_x.update(ey)
+            vy   = self.pid_y.update(ex)
 
+            # Yakın mesafede yaw düzeltmesi thruster'ları yatay iter
+            # ve kenetlemeyi zorlaştırabilir. 5° altında yaw kontrolünü kes.
+            if abs(yaw) > np.deg2rad(5):
+                vyaw = self.pid_yaw.update(-yaw)
+            else:
+                vyaw = 0.0
+
+            # dist_v kullan: dikey mesafe azaldıkça hız düşür (%30 → %100 arası)
             ratio = np.clip(
-                (dist - config.DIST_DOCKED) /
-                (config.DIST_DESCENDING - config.DIST_DOCKED),
-                0, 1
+                (dist_v - config.DIST_DOCKED) /
+                max(self.last_dist_v - config.DIST_DOCKED, 0.01),
+                0.0, 1.0
             )
+            vz = -config.MAX_VERTICAL * (0.3 + 0.7 * ratio)  # negatif = aşağı
 
-            # Robot yaklaştıkça vz hızı %30 ile %100 arasında değişir
-            vz = -config.MAX_VERTICAL * (0.3 + 0.7 * ratio)
+            self._send(vx, vy, vz, vyaw)
 
-            self.rov.send_velocity(vx, vy, vz, vyaw)
+    # ─────────────────────────────────────────
+    # HIZ GÖNDER + DEBUG YAYINI
+    # ─────────────────────────────────────────
+    def _send(self, vx, vy, vz, vyaw):
+        self.rov.send_velocity(vx, vy, vz, vyaw)
+        msg      = Float32MultiArray()
+        msg.data = [float(vx), float(vy), float(vz), float(vyaw)]
+        self.pub_cmd.publish(msg)
 
+    # ─────────────────────────────────────────
     # HUD
-    def _hud(self, img, cx, cy, dist, yaw):
-
-        half_w = config.IMAGE_WIDTH // 2
-        half_h = config.IMAGE_HEIGHT // 2
-
-        CAMERA_OFFSET = 0.20
-        fx = config.FOCAL_LENGTH_PX
-
-        offset_px = int((fx * CAMERA_OFFSET) / max(dist, 0.3))
+    # ─────────────────────────────────────────
+    def _hud(self, img, cx, cy, dist_h, dist_v, yaw, mcnt):
+        half_w    = config.IMAGE_WIDTH  // 2
+        half_h    = config.IMAGE_HEIGHT // 2
+        fx        = config.FOCAL_LENGTH_PX
+        offset_px = int(fx * config.CAMERA_FORWARD_OFFSET_M / max(dist_h, 0.3))
 
         tx = half_w
-        ty = half_h + offset_px
+        ty = half_h - offset_px   # kontrol ile aynı hedef
 
-        # kırmızı artı -> platformun merkezi
-        # mavi x -> hedefin merkezi
-        # sarı çizgi -> hedefe doğru yön
-
-        cv2.drawMarker(img, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 40, 2)
-        cv2.drawMarker(img, (tx, ty), (255, 0, 0), cv2.MARKER_TILTED_CROSS, 25, 2)
+        # Kırmızı ✛ → platform marker merkezi (algılanan)
+        # Mavi  ✕ → araç merkezinin platforma hizalanması gereken nokta
+        # Sarı  ─ → hata vektörü
+        cv2.drawMarker(img, (cx, cy), (0, 0, 255),   cv2.MARKER_CROSS,         40, 2)
+        cv2.drawMarker(img, (tx, ty), (255, 0, 0),   cv2.MARKER_TILTED_CROSS,  25, 2)
         cv2.line(img, (cx, cy), (tx, ty), (0, 255, 255), 2)
 
-        cv2.putText(img, f"State: {self.state}", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        yaw_deg = np.rad2deg(yaw)
 
-        cv2.putText(img, f"Dist: {dist:.2f}", (20, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        cv2.putText(img, f"State:  {self.state}",          (20,  35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        cv2.putText(img, f"Dist H: {dist_h:.2f} m",        (20,  70), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        cv2.putText(img, f"Dist V: {dist_v:.2f} m",        (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        cv2.putText(img, f"Yaw:    {yaw_deg:.1f} deg",     (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        cv2.putText(img, f"Markers:{mcnt}",                (20, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
-    # SHUTDOWN SAFE
+    # ─────────────────────────────────────────
+    # SHUTDOWN
+    # ─────────────────────────────────────────
     def destroy_node(self):
         self.rov.stop()
         super().destroy_node()
