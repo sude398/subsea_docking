@@ -21,7 +21,17 @@ class PID:
 
     def update(self, e):
         now = time.time()
-        dt = np.clip(now - self.last_time, 0.01, 0.1)
+
+        # Küçük hatada kontrolü devre dışı bırakır ve son çıkışı yumuşak şekilde azaltır (deadband + smoothing)
+        if abs(e) < 0.01:
+            self.last_out *= 0.5  # Hızı her döngüde yarıya düşür (süzülme)
+            self.last_e = e
+            self.last_time = now
+            return self.last_out  # süzülen hızı gönder
+
+        #dt = np.clip(now - self.last_time, 0.01, 0.1)
+        dt = np.clip(now - self.last_time, 0.02, 0.08) # daha stabil derivative ve rov için daha gerçekçi
+
 
         self.integral += e * dt
         self.integral = np.clip(self.integral, -self.integral_limit, self.integral_limit)
@@ -42,6 +52,8 @@ class PID:
         self.last_out = out
         self.last_e = e
         self.last_time = now
+
+        
         return out
 
 
@@ -57,18 +69,42 @@ class Kalman2D:
         self.Q = np.eye(4) * 0.02
         self.R = np.eye(2) * 0.05
 
+        self.R_base = np.eye(2) * 0.05  # EKLENDİ (adaptive R için base noise)
+        self.last_time = time.time()    # EKLENDİ (dynamic dt için zaman takibi)
+        self.initialized = False        # EKLENDİ (ilk ölçüm stabil başlatma)
+
     def update(self, z):
-        dt = 0.04
+        # dt = 0.04 #ESKİ HAL: sabit zaman adımı kullanılıyordu (FPS bağımlıydı)
+        now = time.time() # alttaki için eklendi
+        dt = np.clip(now - self.last_time, 0.01, 0.1) # YENİ HAL: gerçek zaman farkı kullanılıyor → daha stabil ve gerçekçi
+        self.last_time = now # eklendi
+
         self.F[0,2] = dt
         self.F[1,3] = dt
+
+        # EKLENDİ: ilk ölçümde Kalman state direkt başlatılıyor
+        if not self.initialized:
+            self.x[0,0], self.x[1,0] = z
+            self.initialized = True
+            return z[0], z[1]
 
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
 
+        #EKLENDİ: measurement büyüklüğüne göre noise artırılıyor (uzak/noisy ölçüm daha az güvenilir)
+        distance = np.linalg.norm(z)
+        self.R = self.R_base * (1 + 0.8 * distance)
+
         z = np.array(z).reshape(2,1)
         y = z - self.H @ self.x
         S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        # K = self.P @ self.H @ self.H.T.T @ np.linalg.inv(S) #Eski hal
+        K = self.P @ self.H.T @ np.linalg.inv(S) #YENİ DOĞRU HAL
+
+        # EKLENDİ: outlier rejection (çok büyük hata varsa update yapılmaz)
+        if np.linalg.norm(y) > 1.5:
+            return self.x[0,0], self.x[1,0]
 
         self.x = self.x + K @ y
         self.P = (np.eye(4) - K @ self.H) @ self.P
