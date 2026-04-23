@@ -1,5 +1,6 @@
 import os
 import time
+
 import rclpy
 from rclpy.node import Node
 
@@ -15,7 +16,7 @@ from config import (
     IMAGE_WIDTH, IMAGE_HEIGHT,
     MAX_LATERAL, MAX_YAW,
     DIST_ALIGN, DIST_DESCENDING, FINAL_ALIGN_DIST, DIST_DOCKED,
-    PRECISION_THRESH, HOVER_TIME, FAILSAFE_LOST,
+    PRECISION_THRESH, HOVER_TIME, FAILSAFE_LOST, CAMERA_OFFSET_Y, CONFIDENCE_THRESHOLD,
     SERIAL_PORT, BAUD_RATE
 )
 from controller import PID, Kalman2D
@@ -99,11 +100,9 @@ class DockingNode(Node):
         frame = cv2.rotate(frame, cv2.ROTATE_180)
         frame, visible, locked, n_valid, target_tvec, target_yaw, d_v = self.vision.process(frame)
 
-        x_w, y_w, d_h = 0.0, 0.0, 0.0
-
-        # ── Kontrol Hesaplama ──
+        # Başlangıç değerleri (d_h 999.0 ile "kör" yaklaşma hatası önlenir)
+        x_w, y_w, d_h = 0.0, 0.0, 999.0
         vx, vy, vz, vyaw = 0.0, 0.0, 0.0, 0.0
-        vz_log = 0.0 # Terminal logu için
 
         if visible and target_tvec is not None:
             self.last_seen_t = time.time()
@@ -111,108 +110,102 @@ class DockingNode(Node):
             x_w, y_w = self.kalman.update([raw_x, raw_y])
             d_h = np.sqrt(x_w**2 + y_w**2)
 
-            # PID çıktılarını hafızaya al
             self.last_vx = self.pid_x.update(y_w)
             self.last_vy = self.pid_y.update(x_w)
             self.last_vyaw = self.pid_yaw.update(-target_yaw)
 
-        # ── Terminale Detaylı Bilgi Basma (Her 10 döngüde bir - Terminali kirletmemek için) ──
-        if int(time.time() * 25) % 10 == 0:
-            self.get_logger().info(
-                f"[{self.state}] Vis:{visible} | MKR:{n_valid} | "
-                f"x:{x_w:.2f} y:{y_w:.2f} dv:{d_v:.2f} | "
-                f"vx:{self.last_vx:.2f} vy:{self.last_vy:.2f} vz:{vz_log:.2f}"
-            )
-
+        # ── Güven ve Onay Mekanizması ──
         if n_valid >= 4:
-            self.approach_confidence += 1
-            if self.approach_confidence >= CONFIDENCE_THRESHOLD:
-                self.confirmed_4_markers = True
-                self.get_logger().info("✅ 4 Marker Onaylandı. İniş yetkisi verildi.")
+            self.approach_confidence = min(CONFIDENCE_THRESHOLD + 10, self.approach_confidence + 1)
         else:
-            self.approach_confidence = max(0, self.approach_confidence - 1)
+            # İniş aşamasındaysak güven puanını düşürme (marker kaybı normaldir)
+            if self.state not in ["DESCENDING", "FINAL_ALIGN"]:
+                self.approach_confidence = max(0, self.approach_confidence - 1)
 
-        # ── FSM Durum Geçişleri ──
-        # (FSM blokların burada aynen kalıyor, sadece logları info seviyesinde tut)
+        # Onay Kilidi: Sadece Searching modunda sıfırlanır
+        if self.approach_confidence >= CONFIDENCE_THRESHOLD and not self.confirmed_4_markers:
+            self.confirmed_4_markers = True
+            self.get_logger().info("✅ 4 Marker Onaylandı. İniş yetkisi verildi.")
+
+        # ── FSM (Sonlu Durum Makinesi) ──
         if self.state == "SEARCHING":
-            # Arama modundaysak hafızayı temizle
-            self.confirmed_4_markers = False
+            # Arama modunda hafızayı temizle
+            if self.confirmed_4_markers:
+                self.confirmed_4_markers = False
+                self.get_logger().info(">>> SEARCHING: Yetkiler sıfırlandı.")
+            
             self.approach_confidence = 0
             
             if self.search_start_t is None:
                 self.search_start_t = time.time()
 
-            elapsed = time.time() - self.search_start_t
-
-            # Sadece hedef 10 saniyeden uzun süredir kayıpsa onayları sıfırla
-            # Bu sayede anlık marker kayıplarında 'confirmed_4_markers' True kalmaya devam eder
-            if elapsed > 10.0:
-                self.confirmed_4_markers = False
-                self.approach_confidence = 0
-                self.get_logger().info(">>> Hedef 10s boyunca bulunamadı, hafıza sıfırlandı.")
-
-            # marker görüldüyse aligbinge geç, yoksa 5 saniye ileri sonra dönmeye başla
             if visible:
                 self.state = "ALIGNING"
-                self.search_start_t = None # Zamanlayıcıyı sıfırla
+                self.search_start_t = None
                 self.get_logger().info(">>> SEARCHING -> ALIGNING")
             else:
                 elapsed = time.time() - self.search_start_t
-                
-                if elapsed < 5.0: # İlk 5 saniye ileri git
-                    vx = 0.15    # %15 hızla ileri
+                if elapsed < 5.0:
+                    vx = 0.15
                     vyaw = 0.0
-                    self.get_logger().info("Searching: İleri gidiliyor...", once=True)
-                else:            # 5 saniye dolunca dönmeye başla
+                else:
                     vx = 0.0
-                    vyaw = 0.2   # Kendi ekseninde tarama hızı
-                    self.get_logger().info("Searching: Etraf taranıyor...", once=True)
+                    vyaw = 0.2
         
-        elif self.state == "ALIGNING" and d_h < DIST_ALIGN:
-            if y_w < 1.5: # Belirli bir yakınlığa gelince yaklaşmaya başla
+        elif self.state == "ALIGNING":
+            if not visible and (time.time() - self.last_seen_t > 2.0):
+                self.state = "SEARCHING"
+                self.get_logger().warn(">>> Hedef Kayboldu: ALIGNING -> SEARCHING")
+            elif d_h < DIST_ALIGN:                
                 self.state = "APPROACHING"
-            self.get_logger().info(">>> ALIGNING -> APPROACHING")
+                self.get_logger().info(">>> ALIGNING -> APPROACHING")
         
-        elif self.state == "APPROACHING" and y_w > DIST_DESCENDING:
-            
-            # Sadece ofset değerini geçmesi değil, ofsetin +/- 15cm yakınında olması şartı
-            upper_bound = CAMERA_OFFSET_Y + 0.15
-            lower_bound = CAMERA_OFFSET_Y - 0.15
-            
-            # KRİTİK ŞART: 4 marker görüldü mü VE araç merkezi ofset değerini geçti mi?
-            if self.confirmed_4_markers and y_w < CAMERA_OFFSET_Y:
+        elif self.state == "APPROACHING":
+            if not visible and (time.time() - self.last_seen_t > 3.0):
+                self.state = "SEARCHING"
+                self.get_logger().warn(">>> Hedef Kayboldu: APPROACHING -> SEARCHING")
+            elif self.confirmed_4_markers and y_w < CAMERA_OFFSET_Y:
                 self.state = "DESCENDING"
                 self.get_logger().warn("!!! DESCENDING STARTED")
         
-        elif self.state == "DESCENDING" and d_v < FINAL_ALIGN_DIST:
-            self.state = "FINAL_ALIGN"
-            self.get_logger().info(">>> DESCENDING -> FINAL_ALIGN")
+        elif self.state == "DESCENDING":
+            vz = -0.15
+            if d_v < FINAL_ALIGN_DIST:
+                self.state = "FINAL_ALIGN"
+                self.get_logger().info(">>> DESCENDING -> FINAL_ALIGN")
         
-        elif (self.state == "FINAL_ALIGN" or self.state == "DESCENDING") and d_v < DIST_DOCKED:
-            self.state = "DOCKED"
-            self.get_logger().info("✅ DOCKED: Görev Tamamlandı.")
+        elif self.state == "FINAL_ALIGN":
+            vz = -0.08
+            if d_v < DIST_DOCKED:
+                self.state = "DOCKED"
+                self.get_logger().info("✅ DOCKED: Görev Tamamlandı.")
+        
+        elif self.state == "DOCKED":
+            vx, vy, vz, vyaw = 0.0, 0.0, 0.0, 0.0
 
-        
-        if self.state == "DOCKED":
-            pass
-        else:
-            if self.state == "DESCENDING": vz = -0.15
-            elif self.state == "FINAL_ALIGN": vz = -0.08
-            
+        # ── Komut Gönderimi ve Sönümleme (Damping) ──
+        if self.state != "DOCKED":
             if visible:
-                # İniş sırasında ileri gitmeyi durdurma mantığı korunuyor
                 if self.state in ["DESCENDING", "FINAL_ALIGN"]:
+                    # İniş sırasında yatay hareketi kes (Atalet riskine karşı)
                     vx, vy = 0.0, 0.0
                 else:
                     vx, vy = self.last_vx, self.last_vy
                 vyaw = self.last_vyaw
             else:
-                # Görünürlük yoksa sönümleme (Searching hızı burayı ezmez çünkü o üstte)
+                # Görüş kaybında yumuşak yavaşlama
                 if self.state in ["DESCENDING", "FINAL_ALIGN", "APPROACHING", "ALIGNING"]:
                     vx, vy, vyaw = self.last_vx * 0.8, self.last_vy * 0.8, self.last_vyaw * 0.8
             
-        vz_log = vz
-        self.send(vx, vy, vz, vyaw)
+            self.send(vx, vy, vz, vyaw)
+
+        # Terminal Logu (25 Hz döngüyü kirletmemek için 10 döngüde bir)
+        if int(time.time() * 25) % 10 == 0:
+            self.get_logger().info(
+                f"[{self.state}] Vis:{visible} | MKR:{n_valid} | "
+                f"x:{x_w:.2f} y:{y_w:.2f} dv:{d_v:.2f} | "
+                f"vx:{vx:.2f} vy:{vy:.2f} vz:{vz:.2f}"
+            )
 
         # ── EKRAN (HUD) ÜZERİNE DETAYLI BİLGİ YAZDIRMA ──
         h_color = (0, 255, 0) if visible else (0, 0, 255)
