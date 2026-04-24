@@ -17,6 +17,7 @@ from config import (
     MAX_LATERAL, MAX_YAW,
     DIST_ALIGN, DIST_DESCENDING, FINAL_ALIGN_DIST, DIST_DOCKED,
     PRECISION_THRESH, HOVER_TIME, FAILSAFE_LOST, CAMERA_OFFSET_Y, CONFIDENCE_THRESHOLD,
+    BLIND_DESCENT_DIST, BLIND_DESCENT_TIMEOUT,
     SERIAL_PORT, BAUD_RATE
 )
 from controller import PID, Kalman2D
@@ -61,6 +62,20 @@ class DockingNode(Node):
         self.last_vx = 0.0
         self.last_vy = 0.0
         self.last_vyaw = 0.0
+
+        # Kör iniş için son bilinen hedef pozu (FOV kaybında kullanılır)
+        self.last_x_w = 0.0
+        self.last_y_w = 0.0
+        self.last_d_h = 999.0
+        self.last_d_v = 999.0
+
+        # d_v gürültüsüne karşı histerezis/kararlılık sayaçları
+        self.desc_stable_cnt = 0
+        self.final_stable_cnt = 0
+
+        # vz komut yumuşatması: FINAL_ALIGN -> DOCKED gibi geçişlerde throttle step'ini
+        # (ve buoyancy kaynaklı ani yukarı sıçramayı) engelleyen 1. derece low-pass
+        self.last_vz_cmd = 0.0
 
         self.master = mavutil.mavlink_connection(SERIAL_PORT, baud=BAUD_RATE)
         self.master.wait_heartbeat(timeout=5)
@@ -110,9 +125,26 @@ class DockingNode(Node):
             x_w, y_w = self.kalman.update([raw_x, raw_y])
             d_h = np.sqrt(x_w**2 + y_w**2)
 
-            self.last_vx = self.pid_x.update(y_w)
-            self.last_vy = self.pid_y.update(x_w)
-            self.last_vyaw = self.pid_yaw.update(-target_yaw)
+            # Son bilinen pozu sakla (kör iniş sırasında kullanılır)
+            self.last_x_w, self.last_y_w = x_w, y_w
+            self.last_d_h, self.last_d_v = d_h, d_v
+
+            # Hedefe yakın micro-salınımı bastırmak için PID girişlerine deadband
+            # (PID sınıfına dokunulmadan, çağrı tarafında). 3 cm / 3° altındaki hatalar
+            # sıfır kabul edilir → kp*e ve kd*d yok → motor buzz biter.
+            APPROACH_ERR_DB = 0.03
+            YAW_ERR_DB = 0.05
+            dx_in = 0.0 if abs(x_w) < APPROACH_ERR_DB else x_w
+            dy_in = 0.0 if abs(y_w) < APPROACH_ERR_DB else y_w
+            dyaw_in = 0.0 if abs(target_yaw) < YAW_ERR_DB else -target_yaw
+
+            self.last_vx = self.pid_x.update(dy_in)
+            self.last_vy = self.pid_y.update(dx_in)
+            self.last_vyaw = self.pid_yaw.update(dyaw_in)
+        else:
+            # Kör mod: FSM kontrolleri sıfıra düşmesin diye son bilinen pozu kullan
+            x_w, y_w = self.last_x_w, self.last_y_w
+            d_h, d_v = self.last_d_h, self.last_d_v
 
         # ── Güven ve Onay Mekanizması ──
         if n_valid >= 4:
@@ -145,12 +177,35 @@ class DockingNode(Node):
                 self.get_logger().info(">>> SEARCHING -> ALIGNING")
             else:
                 elapsed = time.time() - self.search_start_t
-                if elapsed < 5.0:
-                    vx = 0.15
-                    vyaw = 0.0
+                # Son görülmeden bu yana ≤15 s geçtiyse ve kayda değer bir lateral
+                # ofset bilgisi varsa, önce o yöne dönerek "last seen" ipucunu kullan.
+                recent_lost = (time.time() - self.last_seen_t) < 15.0
+                use_hint = recent_lost and abs(self.last_x_w) > 0.05 and elapsed < 3.0
+
+                if use_hint:
+                    # Son görülen yöne yaw; çok hafif ileri hareket
+                    # last_x_w > 0 → hedef sağda → vyaw pozitif (sağa dön)
+                    vx = 0.05
+                    vyaw = 0.25 * float(np.sign(self.last_x_w))
                 else:
-                    vx = 0.0
-                    vyaw = 0.2
+                    # 12 s'lik döngüsel keşif. Her döngüde 3 faz:
+                    #   0-4 s : spiral (ileri + kademeli artan yaw)
+                    #   4-8 s : + yönde sweep (dönerek tara, yerinde)
+                    #   8-12 s: − yönde sweep (simetrik, kör noktaları kapatır)
+                    # Döngü periyodik tekrar eder → takılıp kalmayı ve dead-zone'ları kırar.
+                    base_t = elapsed - 3.0 if recent_lost else elapsed
+                    cycle_t = base_t % 12.0 if base_t > 0 else 0.0
+
+                    if cycle_t < 4.0:
+                        # Spiral: sabit vx + yaw 0.08 → 0.25 arası lineer artar
+                        vx = 0.12
+                        vyaw = 0.08 + 0.17 * (cycle_t / 4.0)
+                    elif cycle_t < 8.0:
+                        vx = 0.0
+                        vyaw = 0.25
+                    else:
+                        vx = 0.0
+                        vyaw = -0.25
         
         elif self.state == "ALIGNING":
             if not visible and (time.time() - self.last_seen_t > 2.0):
@@ -161,24 +216,63 @@ class DockingNode(Node):
                 self.get_logger().info(">>> ALIGNING -> APPROACHING")
         
         elif self.state == "APPROACHING":
-            if not visible and (time.time() - self.last_seen_t > 3.0):
+            # Yakın mesafede kamera FOV'u yüzünden marker kaybı beklenen bir durumdur.
+            # Bu pencerede SEARCHING'e düşmeyi engelle (kör iniş).
+            blind_active = (
+                self.last_d_h < BLIND_DESCENT_DIST
+                and (time.time() - self.last_seen_t) < BLIND_DESCENT_TIMEOUT
+            )
+            if not visible and (time.time() - self.last_seen_t > 3.0) and not blind_active:
                 self.state = "SEARCHING"
                 self.get_logger().warn(">>> Hedef Kayboldu: APPROACHING -> SEARCHING")
             elif self.confirmed_4_markers and y_w < CAMERA_OFFSET_Y:
                 self.state = "DESCENDING"
-                self.get_logger().warn("!!! DESCENDING STARTED")
+                self.get_logger().warn("!!! DESCENDING STARTED (blind=%s)" % (not visible))
         
         elif self.state == "DESCENDING":
-            vz = -0.15
-            if d_v < FINAL_ALIGN_DIST:
+            # Mesafeye göre adaptif iniş hızı: uzakta agresif (-0.15), hedefe yaklaşırken
+            # yumuşak (-0.05). Sabit vz'nin yarattığı throttle step'ini ve sonrasındaki
+            # buoyancy kaynaklı ani yukarı çıkışı engeller.
+            vz = max(-0.15, -0.05 - 0.1 * d_v)
+            # Histerezis: d_v solvePnP çıktısı gürültülüdür. Tek frame'lik sivri inişler
+            # vz'yi anında düşürüp görünür bir "sallanma/geri dönme" hissi yaratıyordu.
+            # Eşikten 0.03 m aşağıda, 3 ardışık frame stabil kalınca geç.
+            if d_v < (FINAL_ALIGN_DIST - 0.03):
+                self.desc_stable_cnt += 1
+            else:
+                self.desc_stable_cnt = 0
+            if self.desc_stable_cnt >= 3:
                 self.state = "FINAL_ALIGN"
+                self.desc_stable_cnt = 0
                 self.get_logger().info(">>> DESCENDING -> FINAL_ALIGN")
+            # Kör iniş tamamlanma fallback'i: görüş BLIND_DESCENT_TIMEOUT (8 s) boyunca
+            # hiç dönmediyse d_v donmuş kalır ve histerezis asla tetiklenmez.
+            # Bu durumda SEARCHING'e düşmek yerine fiziksel ilerlemenin gerçekleştiğini
+            # varsayıp FINAL_ALIGN'a ilerle (dock'u tamamlama yönünde).
+            elif (not visible) and (time.time() - self.last_seen_t) > BLIND_DESCENT_TIMEOUT:
+                self.state = "FINAL_ALIGN"
+                self.desc_stable_cnt = 0
+                self.get_logger().warn(">>> DESCENDING -> FINAL_ALIGN (blind timeout fallback)")
         
         elif self.state == "FINAL_ALIGN":
-            vz = -0.08
-            if d_v < DIST_DOCKED:
+            # Final fazda daha hafif iniş, dock noktasında -0.02'ye kadar yumuşak düşer.
+            # DOCKED (vz=0) geçişindeki throttle sıçramasını minimize eder.
+            vz = max(-0.08, -0.02 - 0.2 * d_v)
+            # Aynı histerezis DOCKED geçişi için de: gürültü yüzünden prematüre DOCKED olmasın.
+            if d_v < (DIST_DOCKED - 0.02):
+                self.final_stable_cnt += 1
+            else:
+                self.final_stable_cnt = 0
+            if self.final_stable_cnt >= 3:
                 self.state = "DOCKED"
+                self.final_stable_cnt = 0
                 self.get_logger().info("✅ DOCKED: Görev Tamamlandı.")
+            # Aynı kör iniş fallback'i: uzun süreli görüş kaybında görevi tamamla.
+            # Bu aşamada vehicle dock'a çok yakın olduğu için timeout sonunda DOCKED'a geç.
+            elif (not visible) and (time.time() - self.last_seen_t) > BLIND_DESCENT_TIMEOUT:
+                self.state = "DOCKED"
+                self.final_stable_cnt = 0
+                self.get_logger().warn("✅ DOCKED (blind timeout fallback)")
         
         elif self.state == "DOCKED":
             vx, vy, vz, vyaw = 0.0, 0.0, 0.0, 0.0
@@ -194,10 +288,27 @@ class DockingNode(Node):
                 vyaw = self.last_vyaw
             else:
                 # Görüş kaybında yumuşak yavaşlama
-                if self.state in ["DESCENDING", "FINAL_ALIGN", "APPROACHING", "ALIGNING"]:
+                if self.state in ["DESCENDING", "FINAL_ALIGN"]:
+                    # İniş aşamasında yatay flicker'ı önle: görünürlük/kayıp arası 0↔last_v*0.8 salınımı
+                    # motorlarda gözle görülür sallanmaya sebep oluyordu. Kör iniş yalnızca dikey.
+                    vx, vy, vyaw = 0.0, 0.0, 0.0
+                elif self.state in ["APPROACHING", "ALIGNING"]:
                     vx, vy, vyaw = self.last_vx * 0.8, self.last_vy * 0.8, self.last_vyaw * 0.8
-            
+
+            # vz 1. derece low-pass (alpha=0.2 @ 25 Hz ≈ 160 ms zaman sabiti):
+            # DESCENDING -> FINAL_ALIGN -> DOCKED geçişlerindeki throttle step'ini yutar,
+            # buoyancy kaynaklı ani yukarı sıçramayı engeller.
+            vz = 0.8 * self.last_vz_cmd + 0.2 * vz
+            self.last_vz_cmd = vz
+
             self.send(vx, vy, vz, vyaw)
+        else:
+            # DOCKED: aktif olarak sıfır komut gönder. Pixhawk'ın failsafe timeout'unu
+            # beklemek yerine motorları açıkça durdurur; buoyancy nedeniyle post-dock
+            # yukarı sürüklenmeyi engeller. vz LPF'i de sıfıra doğru süzülür ki
+            # son komutla bu tick arasında kalan küçük negatif değer de kademeli kessin.
+            self.last_vz_cmd *= 0.8
+            self.send(0.0, 0.0, self.last_vz_cmd, 0.0)
 
         # Terminal Logu (25 Hz döngüyü kirletmemek için 10 döngüde bir)
         if int(time.time() * 25) % 10 == 0:

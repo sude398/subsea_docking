@@ -44,5 +44,9 @@ PRECISION_THRESH = 0.03
 HOVER_TIME = 1.2 #  1.2 saniye boyunca sabit kal
 FAILSAFE_LOST = 4.0 # 4 saniye marker görünmezse: tekrar SEARCHING
 
+# Yakın mesafede kamera FOV'undan çıkan marker kaybı beklenen bir durumdur; bu eşiklerle kör iniş devreye girer
+BLIND_DESCENT_DIST = 1.5      # Bu yatay mesafenin altında FOV kaybı beklenir (m)
+BLIND_DESCENT_TIMEOUT = 8.0   # Son bilinen poz ile devam edilecek maksimum süre (s)
+
 SERIAL_PORT = '/dev/ttyACM0'  # Jetson üzerindeki Pixhawk portu
 BAUD_RATE = 115200
