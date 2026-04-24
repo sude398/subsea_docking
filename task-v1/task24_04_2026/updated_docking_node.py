@@ -53,6 +53,9 @@ class DockingNode(Node):
         self.confirmed_4_markers = False
         self.approach_confidence = 0
         self.search_start_t = None
+        # HOLDING state: algı geçici bozulduğunda 3 s'lik hover zamanlayıcısı.
+        # SEARCHING'e düşmeden önceki "dur, tekrar dene" penceresinin ömrü.
+        self.hold_start_t = None
 
         self.last_seen_t = time.time()
         self.armed = False
@@ -76,6 +79,11 @@ class DockingNode(Node):
         # vz komut yumuşatması: FINAL_ALIGN -> DOCKED gibi geçişlerde throttle step'ini
         # (ve buoyancy kaynaklı ani yukarı sıçramayı) engelleyen 1. derece low-pass
         self.last_vz_cmd = 0.0
+
+        # Sürekli perception güven skoru [0, 1]. Binary 'visible' anahtarı yerine
+        # algı güvenilirliğini yumuşak şekilde ifade eder; FOV'dan çıkış veya
+        # anlık oklüzyonlarda pose kestirimini binary switch yerine süzülerek bozar.
+        self.vision_confidence = 0.0
 
         self.master = mavutil.mavlink_connection(SERIAL_PORT, baud=BAUD_RATE)
         self.master.wait_heartbeat(timeout=5)
@@ -119,15 +127,43 @@ class DockingNode(Node):
         x_w, y_w, d_h = 0.0, 0.0, 999.0
         vx, vy, vz, vyaw = 0.0, 0.0, 0.0, 0.0
 
-        if visible and target_tvec is not None:
-            self.last_seen_t = time.time()
+        # ── Perception güven skoru güncellemesi ──
+        # Marker tespit edildiğinde güven yumuşakça artar (1.0'da doyar),
+        # tespit edilemediğinde yumuşakça azalır (0.0'a doğru). Böylece tek
+        # bir kare marker kaybı tüm algıyı "failure" olarak işaretlemez;
+        # FOV sınırında veya anlık oklüzyonda sistem kademeli olarak last-known
+        # poza kayar, tek frame'lik flicker ile FSM/kontrol etkilenmez.
+        markers_seen = visible and target_tvec is not None
+        if markers_seen:
+            self.vision_confidence = min(1.0, self.vision_confidence + 0.15)
+        else:
+            self.vision_confidence = max(0.0, self.vision_confidence - 0.08)
+        conf = self.vision_confidence
+
+        if markers_seen:
             raw_x, raw_y = self.vision.compute_world(target_tvec)
-            x_w, y_w = self.kalman.update([raw_x, raw_y])
+            cur_x, cur_y = self.kalman.update([raw_x, raw_y])
+            cur_d_v = d_v
+
+            # Güven ağırlıklı lineer interpolasyon:
+            #   conf ~ 1.0  → neredeyse tamamen güncel ölçüm (high regime)
+            #   conf ~ 0.4  → güncel + son bilinen karışımı (medium regime)
+            #   conf ~ 0.1  → neredeyse tamamen son bilinen (low regime)
+            # Bu, "binary snap" davranışını sürekli bir füzyonla değiştirir;
+            # reacquire esnasındaki gürültülü ilk kare pose tahminine tam ağırlık
+            # verilmeden son bilinene doğru yumuşakça süzülür.
+            x_w = conf * cur_x + (1.0 - conf) * self.last_x_w
+            y_w = conf * cur_y + (1.0 - conf) * self.last_y_w
+            d_v = conf * cur_d_v + (1.0 - conf) * self.last_d_v
             d_h = np.sqrt(x_w**2 + y_w**2)
 
-            # Son bilinen pozu sakla (kör iniş sırasında kullanılır)
-            self.last_x_w, self.last_y_w = x_w, y_w
-            self.last_d_h, self.last_d_v = d_h, d_v
+            # last_seen_t ve son bilinen pozu yalnızca güven yeterince yüksekken
+            # güncelle. Bu, flicker/noise framelerin timer'ları sıfırlayıp
+            # blind_active penceresini yanlış ötelemesini engeller.
+            if conf > 0.4:
+                self.last_seen_t = time.time()
+                self.last_x_w, self.last_y_w = x_w, y_w
+                self.last_d_h, self.last_d_v = d_h, d_v
 
             # Hedefe yakın micro-salınımı bastırmak için PID girişlerine deadband
             # (PID sınıfına dokunulmadan, çağrı tarafında). 3 cm / 3° altındaki hatalar
@@ -142,7 +178,10 @@ class DockingNode(Node):
             self.last_vy = self.pid_y.update(dx_in)
             self.last_vyaw = self.pid_yaw.update(dyaw_in)
         else:
-            # Kör mod: FSM kontrolleri sıfıra düşmesin diye son bilinen pozu kullan
+            # Güncel ölçüm yok: son bilinene tam ağırlık ver (pozu asla sıfıra
+            # reset etmeyiz; FSM'in y_w/d_h/d_v'ye dayanan tetikleri anlamlı
+            # kalmalı). Güven skoru bu durumda kademeli olarak düşer ve FSM'deki
+            # SEARCHING fallback'i conf < 0.1 eşiği ile gecikmeli tetiklenir.
             x_w, y_w = self.last_x_w, self.last_y_w
             d_h, d_v = self.last_d_h, self.last_d_v
 
@@ -150,8 +189,11 @@ class DockingNode(Node):
         if n_valid >= 4:
             self.approach_confidence = min(CONFIDENCE_THRESHOLD + 10, self.approach_confidence + 1)
         else:
-            # İniş aşamasındaysak güven puanını düşürme (marker kaybı normaldir)
-            if self.state not in ["DESCENDING", "FINAL_ALIGN"]:
+            # Marker kaybı iniş veya HOLDING'de normaldir (FOV dışı / anlık oklüzyon).
+            # Bu durumlarda 4-marker onayı drain olmasın, aksi halde HOLDING → HOMING
+            # dönüşü confirmed_4_markers'ı kaybetmiş olarak yapılır ve DESCENDING
+            # eşiği yeniden sıfırdan toplanır.
+            if self.state not in ["DESCENDING", "FINAL_ALIGN", "HOLDING"]:
                 self.approach_confidence = max(0, self.approach_confidence - 1)
 
         # Onay Kilidi: Sadece Searching modunda sıfırlanır
@@ -160,21 +202,32 @@ class DockingNode(Node):
             self.get_logger().info("✅ 4 Marker Onaylandı. İniş yetkisi verildi.")
 
         # ── FSM (Sonlu Durum Makinesi) ──
+        # Durumlar: SEARCHING → HOMING → {HOLDING ⇄ HOMING} → DESCENDING → FINAL_ALIGN → DOCKED
+        # HOMING, eski ALIGNING + APPROACHING birleştirmesidir: tek bir mesafe/güven
+        # sürücülü yaklaşma durumu. HOLDING, geçici güven düşüşlerinde SEARCHING'e
+        # atmak yerine hover eden ara bir durumdur.
         if self.state == "SEARCHING":
             # Arama modunda hafızayı temizle
             if self.confirmed_4_markers:
                 self.confirmed_4_markers = False
                 self.get_logger().info(">>> SEARCHING: Yetkiler sıfırlandı.")
-            
+
             self.approach_confidence = 0
-            
+
             if self.search_start_t is None:
                 self.search_start_t = time.time()
 
-            if visible:
-                self.state = "ALIGNING"
+            # Sürekli güven metriği ile giriş: ~4 ardışık kare marker (≈160 ms) gerekir.
+            # Bu, tek frame'lik false-positive'lerin FSM'i SEARCHING'ten kopartmasını önler.
+            if self.vision_confidence > 0.5:
+                self.state = "HOMING"
                 self.search_start_t = None
-                self.get_logger().info(">>> SEARCHING -> ALIGNING")
+                self.get_logger().info(">>> SEARCHING -> HOMING (conf lock)")
+            elif markers_seen:
+                # Kilit birikiyor (conf 0 → 0.5). Bu pencerede yaw/spiral yapma —
+                # marker görünüyor, sadece güven olgunlaşsın diye sabit tut.
+                # Aksi halde search-pattern aracı çevirir ve marker tekrar FOV dışına çıkar.
+                vx, vy, vyaw = 0.0, 0.0, 0.0
             else:
                 elapsed = time.time() - self.search_start_t
                 # Son görülmeden bu yana ≤15 s geçtiyse ve kayda değer bir lateral
@@ -206,28 +259,70 @@ class DockingNode(Node):
                     else:
                         vx = 0.0
                         vyaw = -0.25
-        
-        elif self.state == "ALIGNING":
-            if not visible and (time.time() - self.last_seen_t > 2.0):
-                self.state = "SEARCHING"
-                self.get_logger().warn(">>> Hedef Kayboldu: ALIGNING -> SEARCHING")
-            elif d_h < DIST_ALIGN:                
-                self.state = "APPROACHING"
-                self.get_logger().info(">>> ALIGNING -> APPROACHING")
-        
-        elif self.state == "APPROACHING":
-            # Yakın mesafede kamera FOV'u yüzünden marker kaybı beklenen bir durumdur.
-            # Bu pencerede SEARCHING'e düşmeyi engelle (kör iniş).
+
+        elif self.state == "HOMING":
+            # Eski ALIGNING + APPROACHING birleştirildi. Yatay hizalama + mesafe
+            # kapanışı aynı PID ile yürütülür (kontrol mantığı değişmedi, sadece
+            # FSM topolojisi sadeleşti). Mesafe-bazlı alt-aşama yok; d_h sürekli
+            # küçüldükçe PID azalan hataya adaptif tepki verir.
+
+            # "Commit-to-landing" güvenliği: DESCENDING'e ancak iki durumda geçeriz:
+            #   (a) güven yeterince yüksek → canlı pose'a güvenerek zeml,
+            #   (b) aracı hedefin çok yakınındayız ve marker doğal FOV kaybına uğradı
+            #       (blind-descent penceresi aktif) → dizayn dosyasındaki planlı davranış.
+            # Bu, orta-mesafe düşük-güven ile yanlış landing commit'ini engeller.
             blind_active = (
                 self.last_d_h < BLIND_DESCENT_DIST
                 and (time.time() - self.last_seen_t) < BLIND_DESCENT_TIMEOUT
             )
-            if not visible and (time.time() - self.last_seen_t > 3.0) and not blind_active:
-                self.state = "SEARCHING"
-                self.get_logger().warn(">>> Hedef Kayboldu: APPROACHING -> SEARCHING")
-            elif self.confirmed_4_markers and y_w < CAMERA_OFFSET_Y:
+            commit_safe = (self.vision_confidence > 0.6) or blind_active
+
+            if self.vision_confidence < 0.3:
+                # Algı bozuldu — eski komutları körü körüne uygulamak yerine HOLDING'e
+                # geç. HOMING ↔ HOLDING arasında asimetrik eşik (girişte 0.3, çıkışta 0.6)
+                # chatter'ı engeller.
+                self.state = "HOLDING"
+                self.hold_start_t = None  # HOLDING bloğunda set edilecek
+                self.get_logger().warn(">>> HOMING -> HOLDING (conf drop)")
+            elif self.confirmed_4_markers and y_w < CAMERA_OFFSET_Y and commit_safe:
                 self.state = "DESCENDING"
-                self.get_logger().warn("!!! DESCENDING STARTED (blind=%s)" % (not visible))
+                self.get_logger().warn(
+                    "!!! HOMING -> DESCENDING (conf=%.2f, blind=%s)"
+                    % (self.vision_confidence, blind_active)
+                )
+
+        elif self.state == "HOLDING":
+            # Geçici hover durumu. Vehicle yerinde durur, son bilinen pozu korur,
+            # güven toparlanırsa HOMING'e geri döner. Üç çıkış yolu vardır ve sıra
+            # önemlidir: önce reacquire, sonra close-range commit, en son timeout.
+            if self.hold_start_t is None:
+                self.hold_start_t = time.time()
+            time_in_hold = time.time() - self.hold_start_t
+
+            blind_active = (
+                self.last_d_h < BLIND_DESCENT_DIST
+                and (time.time() - self.last_seen_t) < BLIND_DESCENT_TIMEOUT
+            )
+
+            if self.vision_confidence > 0.6:
+                # Güçlü reacquire: HOMING'e dön (4-marker lock korunmuştur).
+                self.state = "HOMING"
+                self.hold_start_t = None
+                self.get_logger().info(">>> HOLDING -> HOMING (reacquired, conf=%.2f)"
+                                       % self.vision_confidence)
+            elif (blind_active and self.confirmed_4_markers
+                  and self.last_y_w < CAMERA_OFFSET_Y):
+                # Yakın mesafede marker FOV'dan çıktı — tasarlanmış blind-descent
+                # senaryosu. SEARCHING'e geri çekilmek yerine iniş yönünde commit et.
+                self.state = "DESCENDING"
+                self.hold_start_t = None
+                self.get_logger().warn(">>> HOLDING -> DESCENDING (blind commit)")
+            elif time_in_hold > 3.0 and not blind_active:
+                # Gerçek kayıp: 3 s boyunca algı toparlanmadı ve yakın-aralık
+                # pencerede değiliz. SEARCHING'e düş ve aktif aramaya başla.
+                self.state = "SEARCHING"
+                self.hold_start_t = None
+                self.get_logger().warn(">>> HOLDING -> SEARCHING (hold timeout)")
         
         elif self.state == "DESCENDING":
             # Mesafeye göre adaptif iniş hızı: uzakta agresif (-0.15), hedefe yaklaşırken
@@ -278,26 +373,27 @@ class DockingNode(Node):
             vx, vy, vz, vyaw = 0.0, 0.0, 0.0, 0.0
 
         # ── Komut Gönderimi ve Sönümleme (Damping) ──
+        # State-driven: her durum neyi komutlayacağını kendisi belirler. Eski
+        # "visible → last_v / not-visible → 0.8 × last_v" sönümleme kuralı artık
+        # gereksiz; onun yerine HOLDING durumu "algı geçici bozuldu, dur ve bekle"
+        # davranışını açıkça üstlenir.
         if self.state != "DOCKED":
-            if visible:
-                if self.state in ["DESCENDING", "FINAL_ALIGN"]:
-                    # İniş sırasında yatay hareketi kes (Atalet riskine karşı)
-                    vx, vy = 0.0, 0.0
-                else:
-                    vx, vy = self.last_vx, self.last_vy
-                vyaw = self.last_vyaw
-            else:
-                # Görüş kaybında yumuşak yavaşlama
-                if self.state in ["DESCENDING", "FINAL_ALIGN"]:
-                    # İniş aşamasında yatay flicker'ı önle: görünürlük/kayıp arası 0↔last_v*0.8 salınımı
-                    # motorlarda gözle görülür sallanmaya sebep oluyordu. Kör iniş yalnızca dikey.
-                    vx, vy, vyaw = 0.0, 0.0, 0.0
-                elif self.state in ["APPROACHING", "ALIGNING"]:
-                    vx, vy, vyaw = self.last_vx * 0.8, self.last_vy * 0.8, self.last_vyaw * 0.8
+            if self.state == "HOMING":
+                # PID zaten blended pose üzerinde çalıştı; son çıktıyı aynen kullan.
+                vx, vy, vyaw = self.last_vx, self.last_vy, self.last_vyaw
+            elif self.state in ["DESCENDING", "FINAL_ALIGN"]:
+                # İniş yalnızca dikey — yatay flicker ve ataletten kaçınmak için.
+                vx, vy, vyaw = 0.0, 0.0, 0.0
+            elif self.state == "HOLDING":
+                # Hover: yatay ve yaw komutu kesilir, vz LPF üzerinden yumuşakça 0'a iner.
+                vx, vy, vyaw = 0.0, 0.0, 0.0
+                vz = 0.0
+            # SEARCHING: vx/vyaw state bloğunda set edildi (search pattern veya lock hold)
 
             # vz 1. derece low-pass (alpha=0.2 @ 25 Hz ≈ 160 ms zaman sabiti):
-            # DESCENDING -> FINAL_ALIGN -> DOCKED geçişlerindeki throttle step'ini yutar,
-            # buoyancy kaynaklı ani yukarı sıçramayı engeller.
+            # DESCENDING -> FINAL_ALIGN -> DOCKED ve HOMING -> HOLDING gibi
+            # geçişlerdeki throttle step'lerini yutar, buoyancy kaynaklı ani yukarı
+            # sıçramayı engeller.
             vz = 0.8 * self.last_vz_cmd + 0.2 * vz
             self.last_vz_cmd = vz
 
@@ -313,16 +409,24 @@ class DockingNode(Node):
         # Terminal Logu (25 Hz döngüyü kirletmemek için 10 döngüde bir)
         if int(time.time() * 25) % 10 == 0:
             self.get_logger().info(
-                f"[{self.state}] Vis:{visible} | MKR:{n_valid} | "
+                f"[{self.state}] Vis:{visible} Conf:{self.vision_confidence:.2f} | MKR:{n_valid} | "
                 f"x:{x_w:.2f} y:{y_w:.2f} dv:{d_v:.2f} | "
                 f"vx:{vx:.2f} vy:{vy:.2f} vz:{vz:.2f}"
             )
 
         # ── EKRAN (HUD) ÜZERİNE DETAYLI BİLGİ YAZDIRMA ──
-        h_color = (0, 255, 0) if visible else (0, 0, 255)
-        # 1. Satır: Durum ve Görünürlük
+        # Confidence-tier renk kodu: yüksek/orta/düşük = yeşil/sarı/kırmızı.
+        # Bu, binary "visible" renginden çok daha bilgilendiricidir (HOLDING
+        # sırasında bile conf belli bir aralıkta kalabilir).
+        if self.vision_confidence > 0.6:
+            conf_color = (0, 255, 0)
+        elif self.vision_confidence > 0.3:
+            conf_color = (0, 255, 255)
+        else:
+            conf_color = (0, 0, 255)
         cv2.putText(frame, f"STATE: {self.state}", (10, 30), 2, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"VISIBLE: {visible} ({n_valid} Mkr)", (10, 55), 2, 0.6, h_color, 2)
+        cv2.putText(frame, f"VISIBLE: {visible} ({n_valid} Mkr)", (10, 55), 2, 0.6, conf_color, 2)
+        cv2.putText(frame, f"CONF: {self.vision_confidence:.2f}", (10, 75), 2, 0.5, conf_color, 1)
         
         # 2. Satır: Koordinat Hataları (Kalman Filtreli)
         cv2.putText(frame, f"X_Err: {x_w:.2f}m", (10, 90), 2, 0.5, (0, 255, 255), 1)
