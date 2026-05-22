@@ -1,0 +1,185 @@
+from builtins import print
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+
+try:
+    from updated_config import (
+        IMAGE_WIDTH, IMAGE_HEIGHT, MARKER_SIZE,
+        CAMERA_MATRIX, DIST_COEFFS,
+        UNDERWATER_REFRACTION, PLATFORM_ARUCO_IDS,
+        ARUCO_DIAGONAL_PAIRS,
+        CLAHE_CLIP_LIMIT, CLAHE_GRID_SIZE
+    )
+except ImportError:
+    from config import (
+        IMAGE_WIDTH, IMAGE_HEIGHT, MARKER_SIZE,
+        CAMERA_MATRIX, DIST_COEFFS,
+        UNDERWATER_REFRACTION, PLATFORM_ARUCO_IDS,
+        ARUCO_DIAGONAL_PAIRS
+    )
+    # Fallback CLAHE defaults (eski config'te tanımlı olmayabilir)
+    CLAHE_CLIP_LIMIT = 3.0
+    CLAHE_GRID_SIZE = (8, 8)
+
+
+
+# ─────────────────────────────────────────────
+# VISION
+# ─────────────────────────────────────────────
+class Vision:
+    def __init__(self):
+        self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_ARUCO_ORIGINAL)
+
+        # [İYİLEŞTİRME] Sualtı için optimize edilmiş ArUco dedektör parametreleri
+        # (camera_usage_example/pipeline_dual_camera.py ile uyumlu)
+        params = aruco.DetectorParameters()
+        params.adaptiveThreshWinSizeMin    = 5
+        params.adaptiveThreshWinSizeMax    = 23
+        params.adaptiveThreshWinSizeStep   = 4
+        params.minMarkerPerimeterRate      = 0.03
+        params.errorCorrectionRate         = 0.6
+        params.polygonalApproxAccuracyRate = 0.05
+        self.detector = aruco.ArucoDetector(self.aruco_dict, params)
+
+        # [İYİLEŞTİRME] CLAHE kontrast iyileştirmesi (sualtı bulanıklığını azaltır)
+        # (camera_usage_example/pipeline_dual_camera.py ile uyumlu)
+        self.clahe = cv2.createCLAHE(
+            clipLimit=CLAHE_CLIP_LIMIT,
+            tileGridSize=CLAHE_GRID_SIZE
+        )
+
+        h = MARKER_SIZE / 2.0
+        self.single_marker_obj_pts = np.array([
+            [-h,  h, 0.0], [ h,  h, 0.0], [ h, -h, 0.0], [-h, -h, 0.0]
+        ], dtype=np.float32)
+
+    def compute_world(self, tvec):
+        # Nadir kamera: tvec[0]=sağ/sol, tvec[1]=ileri/geri, tvec[2]=yükseklik
+        x = tvec[0] / UNDERWATER_REFRACTION
+        y = tvec[1] / UNDERWATER_REFRACTION
+        return x, y
+
+    def process(self, frame):
+        """
+        Verilen frame üzerinde ArUco tespiti ve pose hesaplama yapar.
+
+        Döndürür:
+            frame       : HUD çizgileri eklenmiş frame
+            visible     : En az 1 geçerli marker tespit edildi mi
+            locked      : Yeterli marker sayısına göre kilitlenme durumu
+            n_valid     : Geçerli marker sayısı
+            target_tvec : Hedef translation vektörü (None olabilir)
+            target_yaw  : Hedef yaw açısı (radyan)
+            d_v         : Dikey mesafe (metre)
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # [İYİLEŞTİRME] CLAHE kontrast iyileştirmesi — sualtı görüntülerinde
+        # marker kenarlarının daha belirgin olmasını sağlar
+        gray = self.clahe.apply(gray)
+
+        corners, ids, _ = self.detector.detectMarkers(gray)
+
+        n_detected = len(ids) if ids is not None else 0
+        visible = False
+        locked = False
+        n_valid = 0
+        target_tvec = None
+        target_yaw = 0.0
+        d_h, d_v = 0.0, 0.0
+
+        if n_detected > 0:
+            aruco.drawDetectedMarkers(frame, corners)
+            tvecs, rvecs = [], []
+            valid_ids = []
+
+            for i in range(n_detected):
+                marker_id = int(ids[i][0])
+                if marker_id not in PLATFORM_ARUCO_IDS:
+                    continue  # Ignore unrelated markers
+
+                ok, r, t = cv2.solvePnP(
+                    self.single_marker_obj_pts,
+                    corners[i][0].astype(np.float32),
+                    CAMERA_MATRIX, DIST_COEFFS
+                )
+                if ok:
+                    tvecs.append(t.flatten())
+                    rvecs.append(r)
+                    valid_ids.append(marker_id)
+
+            n_valid = len(tvecs)
+
+            if n_valid > 0:
+                if n_valid == 1:
+                    target_tvec = tvecs[0]
+                    locked = False
+                
+                elif n_valid == 2:
+                    # İki marker arasındaki 3 boyutlu fark vektörü
+                    diff = tvecs[0] - tvecs[1]
+                    dist_3d = np.linalg.norm(diff)
+                    
+                    # Hedef: İki marker'ın tam orta noktası
+                    target_tvec = (tvecs[0] + tvecs[1]) / 2.0
+                    
+                    # DİYAGONAL KONTROLÜ:
+                    # Aruco ID'lerine göre çapraz kontrol
+                    detected_set = {valid_ids[0], valid_ids[1]}
+                    is_diagonal = any(detected_set == pair for pair in ARUCO_DIAGONAL_PAIRS)
+                    
+                    if is_diagonal:
+                        locked = True  # Diyagonal ID'ler eşleşiyorsa kilitlen
+                        print(f">>> 2 Marker {valid_ids}: Diyagonal Kilit Sağlandı")
+                    else:
+                        locked = False # Diyagonal değilse kilitlenme, 3. marker bekleniyor...
+                        print(f">>> 2 Marker {valid_ids}: Diyagonal değil, 3. marker bekleniyor...")
+                
+                elif n_valid == 3:
+                    max_d = 0
+                    pair = (0, 1)
+                    for i in range(3):
+                        for j in range(i+1, 3):
+                            d = np.linalg.norm(tvecs[i] - tvecs[j])
+                            if d > max_d:
+                                max_d = d
+                                pair = (i, j)
+                    target_tvec = (tvecs[pair[0]] + tvecs[pair[1]]) / 2.0
+                    locked = True
+                
+                elif n_valid >= 4:
+                    target_tvec = np.mean(tvecs[:4], axis=0)
+                    locked = True
+
+                if target_tvec is not None:
+                    visible = True
+
+                    R, _ = cv2.Rodrigues(rvecs[0])
+                    target_yaw = np.arctan2(R[1,0], R[0,0])
+
+                    # Nadir kamera: tvec[2] doğrudan yükseklik
+                    d_v = abs(target_tvec[2]) / UNDERWATER_REFRACTION
+
+                    # 3D merkez noktasını 2D ekrana iz düşür (Project 3D to 2D)
+                    # target_tvec zaten kamera koordinatlarında olduğu için rvec ve tvec sıfır verilir
+                    image_pts, _ = cv2.projectPoints(
+                        np.array([target_tvec], dtype=np.float32), 
+                        np.zeros((3,1)), np.zeros((3,1)), 
+                        CAMERA_MATRIX, DIST_COEFFS
+                    )
+                    center_px = tuple(image_pts[0][0].astype(int))
+                    
+                    # Ekrana bir hedef dairesi ve artı işareti çiz
+                    cv2.circle(frame, center_px, 12, (0, 0, 255), 2) # Kırmızı daire
+                    cv2.line(frame, (center_px[0]-15, center_px[1]), (center_px[0]+15, center_px[1]), (0, 0, 255), 2)
+                    cv2.line(frame, (center_px[0], center_px[1]-15), (center_px[0], center_px[1]+15), (0, 0, 255), 2)
+                    
+                    # Merkezin yanına anlık kamera koordinatlarını yaz
+                    cv2.putText(frame, "TARGET CENTER", (center_px[0] + 15, center_px[1] - 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.putText(frame, f"CAM_XYZ: {target_tvec[0]:.2f}, {target_tvec[1]:.2f}, {target_tvec[2]:.2f}", 
+                                (center_px[0] + 15, center_px[1] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        
+        return frame, visible, locked, n_valid, target_tvec, target_yaw, d_v
